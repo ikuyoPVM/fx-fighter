@@ -110,7 +110,8 @@ fx-fighter/
 
 | 项 | 值 |
 |---|---|
-| 频率 | 每 60 秒一次（对齐到每分钟 :05 秒）；失败重试 3 次，跳变 > 5% 视为脏数据丢弃 |
+| 频率 | 每 **120 秒**一次（对齐到 :05 秒，两次请求绝不短于间隔）；撞到 429 按 `retry-after` + 5/10/20/30 分钟指数退避，绝不原地重试；跳变 > 5% 视为脏数据丢弃 |
+| 额度 | 上游不带 key 时 `x-ratelimit-limit: 61`，即 **61 次/小时滚动窗口，且被限流后的失败请求同样占额度** → 60 秒一轮（60 次/小时）会把自己锁死，所以固定 120 秒（30 次/小时，留一半余量） |
 | 源 | `api.fxratesapi.com/latest?base=EUR&currencies=USD,JPY,GBP,CHF,AUD,CAD,NZD,CNY` |
 | 存档 | `/var/lib/fx-live/YYYYMMDD.ndjson`（每天一个文件，重启不丢当天数据） |
 | 输出 | `/var/www/ikuyo.xyz/fx/live.js`（`window.FX_LIVE={src,ts,quoteTs,legs,days:[{d,tape}]}`） |
