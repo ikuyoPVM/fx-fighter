@@ -2,13 +2,20 @@
 # -*- coding: utf-8 -*-
 """fx-live — 常驻的实时汇率中继。
 
-每 60 秒抓一次真实汇率（EUR 基准的 8 条腿：USD JPY GBP CHF AUD CAD NZD CNY），
+每 INTERVAL 秒抓一次真实汇率（EUR 基准的 8 条腿：USD JPY GBP CHF AUD CAD NZD CNY），
 写进 /var/www/ikuyo.xyz/fx/live.js，里面的 tape 是「当天已走过的真实分钟价」。
 
   * 不管有没有人打开页面，它都在跑（systemd 常驻 + Restart=always）
   * 每天一个 tape 文件 /var/lib/fx-live/YYYYMMDD.ndjson，重启不丢当天数据
-  * 抓取失败不会写坏文件：保留上一份，客户端会显示「N 分钟前」或「离线」
+  * 抓取失败不会写坏文件：保留上一份，客户端会显示「报价 N 分钟前」或「离线」
   * 13 个货币对由这 8 条腿按与 rates.js 完全相同的公式推导，三角一致性 0 偏差
+
+额度约束（2026-10 实测，很重要）：
+  上游 api.fxratesapi.com 不带 key 时是 x-ratelimit-limit: 61 —— 61 次/小时的滚动窗口，
+  而且**被限流后的失败请求同样占额度**。所以
+    1) 轮询间隔取 120 秒（30 次/小时，留一半余量）；
+    2) 撞到 429 就按 retry-after + 指数退避**安静一段时间**，让窗口排空；
+       绝不原地重试 —— 越重试越排不空，之前就是这样把自己锁死 4 小时的。
 """
 import datetime
 import json
@@ -23,7 +30,8 @@ import urllib.request
 OUT = '/var/www/ikuyo.xyz/fx/live.js'
 STORE = '/var/lib/fx-live'
 LOG = '/var/log/fx-live.log'
-INTERVAL = 60
+INTERVAL = 120          # 30 次/小时，上游额度 61 次/小时
+BACKOFF = [300, 600, 1200, 1800]   # 连续失败后的静默时长：5/10/20/30 分钟
 LEGS = ['USD', 'JPY', 'GBP', 'CHF', 'AUD', 'CAD', 'NZD', 'CNY']
 UA = 'fx-fighter-live/1.0 (+https://ikuyo.xyz/fx/)'
 
@@ -39,10 +47,35 @@ def log(msg):
     print(line, flush=True)
 
 
+class RateLimited(Exception):
+    def __init__(self, wait_s):
+        Exception.__init__(self, 'rate limited, retry in %ds' % wait_s)
+        self.wait_s = wait_s
+
+
 def http_json(url, timeout=25):
     req = urllib.request.Request(url, headers={'User-Agent': UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise RateLimited(parse_retry_after(e.headers))
+        raise
+
+
+def parse_retry_after(headers):
+    """上游给的是毫秒时间戳（如 1793037370856），也兼容秒数和秒偏移。"""
+    raw = (headers.get('retry-after') or '').strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return 60.0
+    if v > 1e12:                      # 毫秒
+        return max(5.0, v / 1000.0 - time.time())
+    if v > 1e9:                       # 秒级时间戳
+        return max(5.0, v - time.time())
+    return max(5.0, v)                # 秒偏移
 
 
 def fetch_fxratesapi():
@@ -57,15 +90,7 @@ def fetch_fxratesapi():
             raise RuntimeError('missing leg ' + k)
         legs[k] = float(rates[k])
     ts = int(d.get('timestamp') or time.time())
-    return legs, ts, 'fxratesapi.com (60s)'
-
-
-def fetch_swissquote():
-    """备用：逐品种问瑞士quote的公开报价，只用来校验 EURUSD 量级（不写 tape）"""
-    d = http_json('https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/EUR/USD')
-    bid = d[0]['spreadProfilePrices'][0]['bid']
-    ask = d[0]['spreadProfilePrices'][0]['ask']
-    return (bid + ask) / 2
+    return legs, ts, 'fxratesapi.com (%ds)' % INTERVAL
 
 
 def sane(legs):
@@ -137,48 +162,52 @@ def write_live(ts, quote_ts, legs, src):
 
 
 def tick(last_good):
+    """一次抓取。返回 (last_good, ok, err)；err 里带着要静默多久。"""
     ts = int(time.time())
-    legs = quote_ts = src = None
-    err = None
-    for attempt in range(3):
-        try:
-            legs, quote_ts, src = fetch_fxratesapi()
-            sane(legs)
-            break
-        except Exception as e:
-            err = e
-            legs = None
-            time.sleep(4)
-    if legs is None:
-        log('fetch failed: %s' % err)
-        return last_good, 0
+    try:
+        legs, quote_ts, src = fetch_fxratesapi()
+        sane(legs)
+    except RateLimited as e:
+        return last_good, 0, e
+    except Exception as e:
+        return last_good, 0, e
     # 和上一条比，跳变超过 5% 就当成脏数据
     if last_good:
         for k in LEGS:
             prev = last_good.get(k)
             if prev and abs(legs[k] / prev - 1) > 0.05:
                 log('reject jump on %s: %s -> %s' % (k, prev, legs[k]))
-                return last_good, 0
+                return last_good, 0, RuntimeError('jump on %s' % k)
     append_tick(ts, legs, quote_ts)
     size, tape_info = write_live(ts, quote_ts, legs, src)
     log('ok EURUSD=%.5f USDJPY=%.3f  live.js=%dB  ticks=%s' % (
         legs['USD'], legs['JPY'] / legs['USD'], size,
         ','.join('%s:%d' % (k, v) for k, v in sorted(tape_info.items()))))
-    return legs, 1
+    return legs, 1, None
 
 
 def main():
     os.makedirs(STORE, exist_ok=True)
     log('fx-live started, interval=%ds, out=%s' % (INTERVAL, OUT))
     last_good = None
+    streak = 0
     while True:
-        try:
-            last_good, ok = tick(last_good)
-        except Exception as e:
-            log('tick crashed: %r' % e)
-        # 对齐到下一分钟的 :05 秒
+        last_good, ok, err = tick(last_good)
+        wait = INTERVAL
+        if ok:
+            if streak:
+                log('recovered after %d failures' % streak)
+            streak = 0
+        else:
+            streak += 1
+            wait = BACKOFF[min(streak, len(BACKOFF)) - 1]
+            extra = getattr(err, 'wait_s', 0) or 0
+            if extra > wait:
+                wait = min(int(extra) + 5, 1800)
+            log('fetch failed (streak %d): %s  → 静默 %ds' % (streak, err, wait))
+        # 对齐到 :05 秒，减少和上游整分钟窗口的撞车
         now = time.time()
-        nxt = (int(now / INTERVAL) + 1) * INTERVAL + 5
+        nxt = (int(now / wait) + 1) * wait + 5
         time.sleep(max(5, nxt - now))
 
 
