@@ -6,24 +6,31 @@
 
 ## 在线地址
 
-| 地址 | 说明 |
+| 地址 | 状态 |
 |---|---|
-| <https://fx.ikuyo.xyz/> | 自定义域名（需在 Cloudflare 加 CNAME `fx` → `ikuyopvm.github.io`） |
-| <https://ikuyopvm.github.io/fx-fighter/> | GitHub Pages 默认地址，随仓库自动发布 |
-| <https://ikuyo.xyz/fx/> | 内嵌在 IKUYO NEWS 站点里的同一份（服务器 nginx） |
+| <https://ikuyo.xyz/fx/> | ✅ 已上线（同域部署在 IKUYO NEWS 站点的 `/fx/`，nginx 直接托管） |
+| <https://ikuyopvm.github.io/fx-fighter/> | ✅ 已上线（GitHub Pages，本仓库 main 分支根目录） |
+| `https://fx.ikuyo.xyz/` | ⏳ 需要在 Cloudflare 加一条 `fx` → `ikuyopvm.github.io` 的 CNAME，然后把本仓库 `CNAME` 文件恢复为 `fx.ikuyo.xyz` |
 
-单文件离线版：把仓库里的四个文件放在一起双击 `index.html` 即可，或使用本地构建的 `fx-fighter.html`。
+## 三个部署位置怎么同步
+
+* **数据**：`rates.js` 由服务器上的 cron（`/opt/fx-fighter/refresh.py`，每工作日 23:40 CST）
+  抓 ECB 参考汇率后重写，同时通过 GitHub Contents API 推回本仓库和 `ikuyo.xyz` 仓库的 `fx/rates.js`，
+  所以 nginx 那份和 Pages 那份都是最新的。
+* **代码**：`index.html` / `engine.js` / `ui.js` 三份部署一致，改完重新部署即可
+  （`tools/deploy/deploy_server.sh` 推服务器，本仓库 push 后 Pages 自动发布）。
+* 本机直连 `github.com:443` 被重置，所以推送走 `tools/deploy/push_api.js`（GitHub Git Data API）。
 
 ## 哪些是真的
 
-* **每个交易日的收盘价是真的**：欧洲央行（ECB）欧元基准中间价，逐交易日，2022-01 至今（1200+ 个交易日）。
-  来源 `api.frankfurter.dev`（ECB 镜像），`tools/build_rates.py` 抓取。
+* **每个交易日的收盘价是真的**：欧洲央行（ECB）欧元基准中间价，逐交易日，2022-01 至今（1200+ 个交易日），
+  来源 `api.frankfurter.dev`（ECB 镜像），脚本 `tools/build_rates.py`。
 * **13 个品种全部由这张 EUR 基准表换算**：`EURUSD = USD`、`USDJPY = JPY/USD`、`GBPUSD = USD/GBP`……，
   交叉盘按两条美元腿相乘除，三角一致性 0 偏差。
 * **每天收在真价上**：日内用布朗桥挂在「昨收 → 今收」之间，23:59 精确等于真实收盘。
 
 **模拟的部分**：日内 1 分钟路径、D1 影线（历史逐日高低价无免费数据，按波动率估）、
-最后一个交易日之后的收盘价（状态栏会标「模拟日」）、以及券商那套点差/滑点/隔夜息参数。
+最后一个交易日之后的收盘价（状态栏会标「模拟日」）、以及券商那套点差 / 滑点 / 隔夜息参数。
 
 ## 撮合规则（摘要）
 
@@ -46,16 +53,17 @@
 按「点」设止损止盈；持仓行 `平` / `半` / `改`。
 键盘 `↑` 做多、`↓` 做空、`空格` 平仓、`Esc` 撤单。账户自动存 localStorage，`⤓ CSV` 导出对账单。
 
-## 数据自动更新
-
-`.github/workflows/refresh-rates.yml`：每个工作日 15:40 UTC（ECB 公布后）抓一次数据，
-数据有变化就提交 `rates.js`，Pages 自动重新发布，并顺带跑一遍 `tools/selftest.js`。
-
 ## 自测
 
 ```bash
-node tools/selftest.js      # 36 项：点值/保证金/强平/隔夜息/周末休市/存档/确定性
+node tools/selftest.js      # 36 项：点值 / 保证金 / 强平 / 隔夜息 / 周末休市 / 存档 / 确定性
 ```
+
+## 备选：用 GitHub Actions 刷新数据
+
+`ops/github-workflow-refresh-rates.yml` 是等价的 Actions 版本。
+本机的 gh token 只有 `repo` 作用域（没有 `workflow`），所以这个文件暂时只能手动在网页里添加；
+加上以后就可以不依赖服务器 cron。
 
 ## 已知局限
 
