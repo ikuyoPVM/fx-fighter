@@ -1,0 +1,17 @@
+[Unit]
+Description=FX FIGHTER live rate relay (writes /var/www/ikuyo.xyz/fx/live.js every 60s)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/fx-fighter/fx-live.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/fx-live.log
+StandardError=append:/var/log/fx-live.log
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
