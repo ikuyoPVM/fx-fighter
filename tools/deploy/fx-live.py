@@ -205,10 +205,10 @@ def main():
             if extra > wait:
                 wait = min(int(extra) + 5, 1800)
             log('fetch failed (streak %d): %s  → 静默 %ds' % (streak, err, wait))
-        # 对齐到 :05 秒，减少和上游整分钟窗口的撞车
+        # 对齐到 :05 秒，减少和上游整分钟窗口的撞车；但两次请求间隔绝不短于 wait
         now = time.time()
         nxt = (int(now / wait) + 1) * wait + 5
-        time.sleep(max(5, nxt - now))
+        time.sleep(max(wait, nxt - now))
 
 
 if __name__ == '__main__':
