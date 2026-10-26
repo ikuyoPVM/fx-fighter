@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""fx-live — 常驻的实时汇率中继。
+
+每 60 秒抓一次真实汇率（EUR 基准的 8 条腿：USD JPY GBP CHF AUD CAD NZD CNY），
+写进 /var/www/ikuyo.xyz/fx/live.js，里面的 tape 是「当天已走过的真实分钟价」。
+
+  * 不管有没有人打开页面，它都在跑（systemd 常驻 + Restart=always）
+  * 每天一个 tape 文件 /var/lib/fx-live/YYYYMMDD.ndjson，重启不丢当天数据
+  * 抓取失败不会写坏文件：保留上一份，客户端会显示「N 分钟前」或「离线」
+  * 13 个货币对由这 8 条腿按与 rates.js 完全相同的公式推导，三角一致性 0 偏差
+"""
+import datetime
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+OUT = '/var/www/ikuyo.xyz/fx/live.js'
+STORE = '/var/lib/fx-live'
+LOG = '/var/log/fx-live.log'
+INTERVAL = 60
+LEGS = ['USD', 'JPY', 'GBP', 'CHF', 'AUD', 'CAD', 'NZD', 'CNY']
+UA = 'fx-fighter-live/1.0 (+https://ikuyo.xyz/fx/)'
+
+# 合理性区间：防止上游返回垃圾把图表打歪
+RANGE = {
+    'USD': (0.5, 2.5), 'JPY': (60, 400), 'GBP': (0.4, 2.0), 'CHF': (0.4, 2.0),
+    'AUD': (0.8, 3.5), 'CAD': (0.8, 3.5), 'NZD': (1.0, 4.0), 'CNY': (4.0, 15.0),
+}
+
+
+def log(msg):
+    line = '[%s] %s' % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg)
+    print(line, flush=True)
+
+
+def http_json(url, timeout=25):
+    req = urllib.request.Request(url, headers={'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def fetch_fxratesapi():
+    url = 'https://api.fxratesapi.com/latest?base=EUR&currencies=' + ','.join(LEGS) + '&places=6'
+    d = http_json(url)
+    if not d.get('success'):
+        raise RuntimeError('bad payload: %s' % str(d)[:120])
+    rates = d['rates']
+    legs = {}
+    for k in LEGS:
+        if k not in rates:
+            raise RuntimeError('missing leg ' + k)
+        legs[k] = float(rates[k])
+    ts = int(d.get('timestamp') or time.time())
+    return legs, ts, 'fxratesapi.com (60s)'
+
+
+def fetch_swissquote():
+    """备用：逐品种问瑞士quote的公开报价，只用来校验 EURUSD 量级（不写 tape）"""
+    d = http_json('https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/EUR/USD')
+    bid = d[0]['spreadProfilePrices'][0]['bid']
+    ask = d[0]['spreadProfilePrices'][0]['ask']
+    return (bid + ask) / 2
+
+
+def sane(legs):
+    for k, (lo, hi) in RANGE.items():
+        v = legs.get(k)
+        if not (v and lo < v < hi):
+            raise RuntimeError('leg %s out of range: %s' % (k, v))
+    return True
+
+
+def day_file(ts):
+    d = datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime('%Y%m%d')
+    return os.path.join(STORE, d + '.ndjson')
+
+
+def append_tick(ts, legs, quote_ts):
+    os.makedirs(STORE, exist_ok=True)
+    with open(day_file(ts), 'a') as f:
+        f.write(json.dumps({'ts': ts, 'q': quote_ts, 'legs': legs}, separators=(',', ':')) + '\n')
+
+
+def read_tape(ts, limit=1600):
+    path = day_file(ts)
+    rows = []
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+    rows = rows[-limit:]
+    tape = {k: [] for k in LEGS}
+    for r in rows:
+        for k in LEGS:
+            v = r.get('legs', {}).get(k)
+            if v:
+                tape[k].append('%d:%s' % (r['ts'], format(v, '.6f').rstrip('0').rstrip('.')))
+    return {k: ','.join(v) for k, v in tape.items() if len(v) >= 2}
+
+
+def write_live(ts, quote_ts, legs, src):
+    # 最近 3 个 UTC 日（含今天）的真实分钟价，客户端按天叠到各自的日内路径上
+    days = []
+    for back in (2, 1, 0):
+        d = datetime.datetime.fromtimestamp(ts - back * 86400, datetime.UTC)
+        day0 = int(d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        tape = read_tape(day0)
+        if tape:
+            days.append({'d': day0, 'tape': tape})
+    payload = {
+        'src': src,
+        'ts': ts,
+        'quoteTs': quote_ts,
+        'legs': {k: round(v, 6) for k, v in legs.items()},
+        'days': days,
+    }
+    text = 'window.FX_LIVE=' + json.dumps(payload, separators=(',', ':')) + ';\n'
+    fd, tmp = tempfile.mkstemp(dir='/tmp', prefix='live-', suffix='.js')
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    subprocess.run(['install', '-o', 'www-data', '-g', 'www-data', '-m', '644', tmp, OUT], check=True)
+    os.unlink(tmp)
+    today = days[-1]['tape'] if days else {}
+    return len(text), {k: len(v.split(',')) for k, v in today.items()}
+
+
+def tick(last_good):
+    ts = int(time.time())
+    legs = quote_ts = src = None
+    err = None
+    for attempt in range(3):
+        try:
+            legs, quote_ts, src = fetch_fxratesapi()
+            sane(legs)
+            break
+        except Exception as e:
+            err = e
+            legs = None
+            time.sleep(4)
+    if legs is None:
+        log('fetch failed: %s' % err)
+        return last_good, 0
+    # 和上一条比，跳变超过 5% 就当成脏数据
+    if last_good:
+        for k in LEGS:
+            prev = last_good.get(k)
+            if prev and abs(legs[k] / prev - 1) > 0.05:
+                log('reject jump on %s: %s -> %s' % (k, prev, legs[k]))
+                return last_good, 0
+    append_tick(ts, legs, quote_ts)
+    size, tape_info = write_live(ts, quote_ts, legs, src)
+    log('ok EURUSD=%.5f USDJPY=%.3f  live.js=%dB  ticks=%s' % (
+        legs['USD'], legs['JPY'] / legs['USD'], size,
+        ','.join('%s:%d' % (k, v) for k, v in sorted(tape_info.items()))))
+    return legs, 1
+
+
+def main():
+    os.makedirs(STORE, exist_ok=True)
+    log('fx-live started, interval=%ds, out=%s' % (INTERVAL, OUT))
+    last_good = None
+    while True:
+        try:
+            last_good, ok = tick(last_good)
+        except Exception as e:
+            log('tick crashed: %r' % e)
+        # 对齐到下一分钟的 :05 秒
+        now = time.time()
+        nxt = (int(now / INTERVAL) + 1) * INTERVAL + 5
+        time.sleep(max(5, nxt - now))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
