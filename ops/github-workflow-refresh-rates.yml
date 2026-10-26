@@ -1,0 +1,43 @@
+name: refresh ECB rates
+
+# 每个交易日 ECB 公布参考汇率后（约 15:00 UTC）抓一次真实数据并提交，
+# GitHub Pages 会自动重新发布，站点上的日线永远是最新的。
+on:
+  schedule:
+    - cron: '40 15 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-rates
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch ECB reference rates
+        run: python tools/build_rates.py rates.js
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- rates.js; then
+            echo "数据没变化，跳过提交"
+            exit 0
+          fi
+          git config user.name  "fx-fighter-bot"
+          git config user.email "fx-fighter-bot@users.noreply.github.com"
+          git add rates.js
+          git commit -m "chore: refresh ECB reference rates ($(date -u +%Y-%m-%d))"
+          git push
+
+      - name: Sanity check the engine
+        run: node tools/selftest.js
